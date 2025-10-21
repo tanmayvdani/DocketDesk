@@ -1,0 +1,6 @@
+*.exe
+.vscode/
+testdocs/
+command.txt
+CaseList.docx
+script.py
