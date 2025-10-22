@@ -16,10 +16,6 @@ A desktop application designed to help legal professionals automatically sort an
 
 The application scans a source directory for supported files. For each file, it searches for pre-configured client names (e.g., "John Smith"). If a match is found, the file is moved or copied to a structured folder in the destination directory (e.g., `Destination/Smith_John/`). Files that do not match any client are left untouched.
 
-## Screenshots
-
-*(Placeholder for a screenshot of the main application window)*
-
 ## Installation
 
 ### For End-Users (Recommended)
