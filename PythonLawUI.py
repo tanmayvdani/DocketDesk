@@ -1,7 +1,14 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
+import configparser
+import threading
 from datetime import datetime
+from pathlib import Path
+
+# Import the backend organizer module
+import Fileorganizer_python as organizer
+from Fileorganizer_python import Client
 
 class LawyerFileOrganizerUI(tk.Tk):
     def __init__(self):
@@ -11,8 +18,20 @@ class LawyerFileOrganizerUI(tk.Tk):
         self.resizable(False, False)
         self.configure(bg="#f3f4f6")  # Light gray background
 
+        # Setup config file for persistent client list
+        self.config_dir = Path.home() / ".LawyerFileOrganizer"
+        self.config_file = self.config_dir / "config.ini"
+        self.config_dir.mkdir(exist_ok=True)
+        self.config_parser = configparser.ConfigParser()
+
         # Initialize client list BEFORE creating widgets
         self.client_list = []
+        
+        # Threading control variables
+        self.processing_thread = None
+        self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.pause_event.set()  # Start in resumed state
         
         # Apply styling first
         self.apply_styles()
@@ -22,6 +41,9 @@ class LawyerFileOrganizerUI(tk.Tk):
         
         # Create all widgets
         self.create_widgets()
+
+        # Load clients from config file
+        self.load_clients_from_config()
         
         # Center the window after initial rendering
         self.after(100, self.center_window)
@@ -61,7 +83,6 @@ class LawyerFileOrganizerUI(tk.Tk):
         self.style.configure("TNotebook.Tab", padding=(12, 6))
         
         # Custom styles
-# Custom styles
         self.style.configure("Primary.TButton", 
                         background="#0078d4", 
                         foreground="white",
@@ -79,6 +100,7 @@ class LawyerFileOrganizerUI(tk.Tk):
                            font=("Segoe UI", 10, "bold"), 
                            foreground="#1f2937")
         self.style.configure("TButton", font=("Segoe UI", 9))
+
     def create_title_bar(self):
         """Create a custom title bar"""
         title_bar = ttk.Frame(self, style="Title.TFrame", height=30)
@@ -166,14 +188,14 @@ class LawyerFileOrganizerUI(tk.Tk):
         self.client_name_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
         # Setup placeholder functionality
-        self.setup_placeholder(self.client_name_entry, "Enter client name")
+        self.setup_placeholder(self.client_name_entry, "Enter client name (First Last or First Middle Last)")
         
         ttk.Button(client_input_frame, text="Add Client", command=self.add_client).pack(side="left")
+        
         self.clients_frame = ttk.Frame(client_manager_frame, style="TFrame")
         self.clients_frame.pack(fill="both", expand=True, pady=8)
         
-        # Don't call update_client_list_ui here - it will be called when we add clients
-        # Just show the initial empty state
+        # Show initial empty state
         self.show_empty_client_list()
 
         # Processing Panel Component
@@ -187,12 +209,17 @@ class LawyerFileOrganizerUI(tk.Tk):
         button_frame = ttk.Frame(processing_frame, style="TFrame")
         button_frame.pack(fill="x", pady=8)
         
-        ttk.Button(button_frame, text="Start Processing", 
-                command=self.start_processing).pack(side="left", padx=(0, 8))
-        ttk.Button(button_frame, text="Pause", 
-                command=self.pause_processing).pack(side="left", padx=(0, 8))
-        ttk.Button(button_frame, text="Stop", 
-                command=self.stop_processing).pack(side="left")
+        self.start_btn = ttk.Button(button_frame, text="Start Processing", 
+                command=self.start_processing)
+        self.start_btn.pack(side="left", padx=(0, 8))
+        
+        self.pause_btn = ttk.Button(button_frame, text="Pause", 
+                command=self.pause_processing, state="disabled")
+        self.pause_btn.pack(side="left", padx=(0, 8))
+        
+        self.stop_btn = ttk.Button(button_frame, text="Stop", 
+                command=self.stop_processing, state="disabled")
+        self.stop_btn.pack(side="left")
         
         self.progress_bar = ttk.Progressbar(processing_frame, orient="horizontal", mode="determinate")
         self.progress_bar.pack(fill="x", pady=6)
@@ -262,6 +289,32 @@ class LawyerFileOrganizerUI(tk.Tk):
         ttk.Label(about_frame, 
                  text="This application helps organize legal documents by client name.", 
                  style="TLabel", wraplength=800).pack(anchor="w", pady=2)
+        
+        # Dependencies info
+        deps_frame = ttk.LabelFrame(self.settings_tab, text="Dependencies", padding=12)
+        deps_frame.pack(fill="x", padx=10, pady=8)
+        
+        try:
+            import PyPDF2
+            pdf_status = "✓ PyPDF2 installed"
+            pdf_color = "green"
+        except ImportError:
+            pdf_status = "✗ PyPDF2 not installed (PDF processing disabled)"
+            pdf_color = "red"
+        
+        try:
+            from docx import Document
+            docx_status = "✓ python-docx installed"
+            docx_color = "green"
+        except ImportError:
+            docx_status = "✗ python-docx not installed (DOCX processing disabled)"
+            docx_color = "red"
+        
+        pdf_label = ttk.Label(deps_frame, text=pdf_status, style="TLabel")
+        pdf_label.pack(anchor="w", pady=2)
+        
+        docx_label = ttk.Label(deps_frame, text=docx_status, style="TLabel")
+        docx_label.pack(anchor="w", pady=2)
 
     def show_empty_client_list(self):
         """Show empty state for client list"""
@@ -290,28 +343,53 @@ class LawyerFileOrganizerUI(tk.Tk):
         client_name = self.client_name_entry.get().strip()
         
         # Check if it's placeholder text
-        if client_name == "Enter client name":
+        if client_name.startswith("Enter client name"):
             messagebox.showwarning("Invalid Input", "Please enter a client name.")
             return
-            
-        if client_name and client_name not in self.client_list:
-            self.client_list.append(client_name)
-            self.client_name_entry.delete(0, tk.END)
-            self.update_client_list_ui()
-            self.log_activity(f"Added client: {client_name}", "info")
-        elif client_name in self.client_list:
-            messagebox.showinfo("Duplicate Client", f"Client '{client_name}' already exists.")
+        
+        if not client_name:
+            return
+        
+        # Parse the name into Client namedtuple
+        parts = client_name.split()
+        client_obj = None
+        
+        if len(parts) == 2:
+            # First Last
+            client_obj = Client(parts[0].lower(), "", parts[1].lower())
+        elif len(parts) == 3:
+            # First Middle Last
+            client_obj = Client(parts[0].lower(), parts[1].lower(), parts[2].lower())
+        else:
+            messagebox.showerror("Invalid Name Format", 
+                               "Please enter name as 'First Last' or 'First Middle Last'.")
+            return
+        
+        # Check for duplicates
+        if client_obj in self.client_list:
+            messagebox.showinfo("Duplicate Client", 
+                              f"Client '{client_name}' is already in the list.")
             self.log_activity(f"Attempt to add duplicate client: {client_name}", "error")
+            return
+        
+        # Add to list
+        self.client_list.append(client_obj)
+        self.client_name_entry.delete(0, tk.END)
+        self.update_client_list_ui()
+        self.save_clients_to_config()
+        self.log_activity(f"Added client: {client_name}", "info")
 
-    def remove_client(self, client_name):
-        if client_name in self.client_list:
-            self.client_list.remove(client_name)
+    def remove_client(self, client):
+        if client in self.client_list:
+            self.client_list.remove(client)
             self.update_client_list_ui()
-            self.log_activity(f"Removed client: {client_name}", "info")
+            display_name = organizer.get_client_display_name(client)
+            self.save_clients_to_config()
+            self.log_activity(f"Removed client: {display_name}", "info")
 
     def update_client_list_ui(self):
         """Update the client list display and status bar"""
-        # Update status bar if it exists
+        # Update status bar
         if hasattr(self, 'client_count_label'):
             self.client_count_label.config(text=f"{len(self.client_list)} clients configured")
         
@@ -325,12 +403,14 @@ class LawyerFileOrganizerUI(tk.Tk):
 
         # Create client cards
         for client in self.client_list:
+            display_name = organizer.get_client_display_name(client)
+            
             client_card = tk.Frame(self.clients_frame, bg="white", relief="solid", 
                                  borderwidth=1, padx=8, pady=4)
             client_card.pack(fill="x", pady=2, padx=2)
             
             # Client name label
-            name_label = tk.Label(client_card, text=client, bg="white", 
+            name_label = tk.Label(client_card, text=display_name, bg="white", 
                                 font=("Segoe UI", 9), anchor="w")
             name_label.pack(side="left", fill="x", expand=True)
             
@@ -350,6 +430,40 @@ class LawyerFileOrganizerUI(tk.Tk):
                 
             remove_btn.bind("<Enter>", on_enter)
             remove_btn.bind("<Leave>", on_leave)
+
+    def load_clients_from_config(self):
+        """Load the client list from the config file on startup."""
+        if not self.config_file.exists():
+            return
+
+        self.config_parser.read(self.config_file)
+        if 'Clients' in self.config_parser:
+            loaded_clients = []
+            for key, value in self.config_parser['Clients'].items():
+                parts = value.split()
+                if len(parts) == 2:
+                    loaded_clients.append(Client(parts[0], "", parts[1]))
+                elif len(parts) == 3:
+                    loaded_clients.append(Client(parts[0], parts[1], parts[2]))
+            
+            if loaded_clients:
+                self.client_list = loaded_clients
+                self.update_client_list_ui()
+                self.log_activity(f"Loaded {len(loaded_clients)} clients from config.", "info")
+
+    def save_clients_to_config(self):
+        """Save the current client list to the config file."""
+        self.config_parser['Clients'] = {}
+        for i, client in enumerate(self.client_list):
+            # Join name parts with a space, filtering out empty middle names
+            name_str = " ".join(filter(None, client))
+            self.config_parser['Clients'][f'client_{i}'] = name_str
+        
+        try:
+            with open(self.config_file, 'w') as f:
+                self.config_parser.write(f)
+        except Exception as e:
+            self.log_activity(f"Error saving client list: {e}", "error")
 
     def get_timestamp(self):
         """Get current timestamp for logging"""
@@ -384,6 +498,37 @@ class LawyerFileOrganizerUI(tk.Tk):
         self.log_text.see(tk.END)
         self.log_text.config(state="disabled")
 
+    # Thread-safe GUI update methods
+    def post_log_message(self, message, log_type="info"):
+        """Thread-safe method to post to the activity log."""
+        self.after(0, self.log_activity, message, log_type)
+
+    def post_progress_update(self, processed_count, total_count):
+        """Thread-safe method to update the progress bar."""
+        def update():
+            if total_count > 0:
+                percent = int((processed_count / total_count) * 100)
+                self.progress_bar["value"] = percent
+                self.progress_text.config(text=f"Processing file {processed_count} of {total_count}... {percent}%")
+            
+            if processed_count == total_count:
+                self.progress_text.config(text="Processing complete!")
+                self.status_label.config(text="Ready")
+                self.toggle_controls(processing=False)
+        
+        self.after(0, update)
+
+    def toggle_controls(self, processing=True):
+        """Enable/disable buttons based on processing state"""
+        if processing:
+            self.start_btn.config(state="disabled")
+            self.pause_btn.config(state="normal")
+            self.stop_btn.config(state="normal")
+        else:
+            self.start_btn.config(state="normal")
+            self.pause_btn.config(state="disabled")
+            self.stop_btn.config(state="disabled")
+
     def start_processing(self):
         """Start file processing with validation"""
         source_dir = self.source_dir_entry.get().strip()
@@ -415,47 +560,62 @@ class LawyerFileOrganizerUI(tk.Tk):
             self.log_activity("No clients configured for processing", "error")
             return
 
-        # Start processing simulation
-        self.log_activity("Processing started...", "info")
+        # Clear the stop event from any previous run
+        self.stop_event.clear()
+        self.pause_event.set()  # Ensure not paused
+        
+        # Update UI
+        self.toggle_controls(processing=True)
         self.status_label.config(text="Processing...")
+        self.log_activity("Processing started...", "info")
         self.progress_bar["value"] = 0
-        self.progress_bar["maximum"] = 100
         
-        # Simulate progress updates
-        self.simulate_progress()
-
-    def simulate_progress(self):
-        """Simulate file processing progress (for demo purposes)"""
-        self.progress_value = 0
+        # Collect config for the backend
+        config = {
+            'src_path': Path(source_dir),
+            'dest_path': Path(dest_dir),
+            'clients_list': self.client_list,
+            'do_move': self.move_files_var.get(),
+            'log_callback': self.post_log_message,
+            'progress_callback': self.post_progress_update,
+            'stop_event': self.stop_event
+        }
         
-        def update_progress():
-            if self.progress_value < 100:
-                self.progress_value += 5
-                self.progress_bar["value"] = self.progress_value
-                self.progress_text.config(text=f"Processing files... {self.progress_value}%")
-                self.after(200, update_progress)
-            else:
-                self.progress_bar["value"] = 100
-                self.progress_text.config(text="Processing complete!")
-                self.log_activity("Processing finished successfully", "success")
-                self.status_label.config(text="Ready")
-                messagebox.showinfo("Processing Complete", "File processing completed successfully!")
-
-        update_progress()
+        # Create and start the worker thread
+        self.processing_thread = threading.Thread(
+            target=organizer.run_organization_task,
+            args=(config,),
+            daemon=True
+        )
+        self.processing_thread.start()
 
     def pause_processing(self):
         """Pause the file processing"""
-        self.log_activity("Processing paused", "info")
-        self.status_label.config(text="Paused")
-        # In a real implementation, you would pause the processing thread here
+        if self.pause_event.is_set():
+            # Currently running, pause it
+            self.pause_event.clear()
+            self.log_activity("Processing paused", "info")
+            self.status_label.config(text="Paused")
+            self.pause_btn.config(text="Resume")
+        else:
+            # Currently paused, resume it
+            self.pause_event.set()
+            self.log_activity("Processing resumed", "info")
+            self.status_label.config(text="Processing...")
+            self.pause_btn.config(text="Pause")
 
     def stop_processing(self):
         """Stop the file processing"""
-        self.log_activity("Processing stopped by user", "info")
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.log_activity("Stop requested by user. Finishing current file...", "error")
+            self.stop_event.set()
+        else:
+            self.log_activity("No process to stop.", "info")
+        
         self.status_label.config(text="Ready")
         self.progress_bar["value"] = 0
         self.progress_text.config(text="")
-        # In a real implementation, you would stop the processing thread here
+        self.toggle_controls(processing=False)
 
 
 if __name__ == "__main__":
