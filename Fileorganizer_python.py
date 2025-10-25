@@ -3,11 +3,10 @@ import sys
 import re
 import shutil
 import logging
-import functools
 import threading
 from pathlib import Path
 from collections import namedtuple, defaultdict, Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Optional imports
 try:
@@ -25,15 +24,12 @@ try:
 except ImportError:
     ahocorasick = None
 
-# --- Logging setup (used only for standalone mode) ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
 Client = namedtuple("Client", ["first", "middle", "last"])
 
-# ====================================================
-# Utility Functions
-# ====================================================
+
 
 def get_client_display_name(client: Client) -> str:
     """Get a display-friendly, capitalized name for the client."""
@@ -132,9 +128,7 @@ def get_unique_filepath(target_dir, filename):
             return new_path
         counter += 1
 
-# ====================================================
-# Core Logic for GUI or External Control
-# ====================================================
+
 
 def run_organization_task(config):
     src_path = Path(config['src_path'])
@@ -211,12 +205,9 @@ def run_organization_task(config):
 
     log(f"Completed: {dict(stats)}", 'summary')
 
-# ====================================================
-# Standalone Mode for Testing
-# ====================================================
 
 if __name__ == "__main__":
-    clients = [Client('john', '', 'doe'), Client('jane', '', 'smith')]
+    clients = [Client('Pranav', '', 'doe'), Client('Abhijit', '', 'None')]
     stop_event = threading.Event()
 
     config = {

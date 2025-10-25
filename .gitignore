@@ -6,4 +6,4 @@ CaseList.docx
 script.py
 build/
 failed_files.log
-__pycache__
+__pycache__/
