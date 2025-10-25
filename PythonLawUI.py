@@ -186,7 +186,8 @@ class LawyerFileOrganizerUI(tk.Tk):
             self.client_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
 
         self.clients_frame.bind("<Configure>", on_frame_configure)
-        self.client_canvas.bind_all("<MouseWheel>", on_mousewheel)
+        self.client_canvas.bind("<MouseWheel>", on_mousewheel)
+        self.clients_frame.bind("<MouseWheel>", on_mousewheel)
 
         self.show_empty_client_list()
 
