@@ -5,9 +5,10 @@ import configparser
 import threading
 from datetime import datetime
 from pathlib import Path
-import pandas as pd 
 import Fileorganizer_python as organizer
 from Fileorganizer_python import Client
+from collections import deque
+import time
 
 class LawyerFileOrganizerUI(tk.Tk):
     def __init__(self):
@@ -28,7 +29,20 @@ class LawyerFileOrganizerUI(tk.Tk):
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
         self.pause_event.set()
-        
+        self._last_progress_update = 0
+
+        self._last_progress_values = (0, 0)
+        self._last_displayed_percent = -1
+        self._progress_lock = threading.Lock()
+        self._progress_update_scheduled = False
+
+        self._log_queue = deque(maxlen=1000)
+        self._log_lock = threading.Lock()
+        self._log_update_scheduled = False
+
+        self.PROGRESS_THROTTLE_MS = 100
+        self.LOG_THROTTLE_MS = 50
+        self.PROGRESS_PERCENT_THRESHOLD = 1
         self.apply_styles()
         
         self.create_title_bar()
@@ -459,16 +473,111 @@ class LawyerFileOrganizerUI(tk.Tk):
         self.log_text.config(state="disabled")
 
     def post_log_message(self, message, log_type="info"):
-        self.after(0, self.log_activity, message, log_type)
+        """
+        Thread-safe throttled log message batching.
+        Messages are queued and written in batches every 50ms.
+        """
+        current_time = time.time() * 1000
+        
+        with self._log_lock:
+            # Add message to queue
+            self._log_queue.append((message, log_type))
+            
+            # Skip if update already scheduled
+            if self._log_update_scheduled:
+                return
+            
+            self._log_update_scheduled = True
+        
+        # Schedule batched log update
+        def batch_update():
+            with self._log_lock:
+                self._log_update_scheduled = False
+                # Drain the queue
+                messages_to_write = list(self._log_queue)
+                self._log_queue.clear()
+            
+            if not messages_to_write:
+                return
+            
+            # Write all queued messages at once
+            self.log_text.config(state="normal")
+            
+            for message, log_type in messages_to_write:
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                
+                log_config = {
+                    "info": ("[INFO]", "blue"),
+                    "success": ("[SUCCESS]", "green"),
+                    "error": ("[ERROR]", "red"),
+                    "file": ("[FILE]", "darkblue"),
+                    "summary": ("[SUMMARY]", "purple")
+                }
+                
+                prefix, color = log_config.get(log_type, ("[INFO]", "blue"))
+                
+                self.log_text.insert(tk.END, f"{prefix} {message} ({timestamp})\n")
+                
+                start_index = self.log_text.index("end-2l")
+                end_index = self.log_text.index("end-1c")
+                self.log_text.tag_add(log_type, start_index, end_index)
+                self.log_text.tag_config(log_type, foreground=color)
+            
+            self.log_text.see(tk.END)
+            self.log_text.config(state="disabled")
+        
+        self.after(self.LOG_THROTTLE_MS, batch_update)
 
     def post_progress_update(self, processed_count, total_count):
-        def update():
-            if total_count > 0:
-                percent = int((processed_count / total_count) * 100)
-                self.progress_bar["value"] = percent
-                self.progress_text.config(text=f"Processing file {processed_count} of {total_count}... {percent}%")
+        """
+        Thread-safe throttled progress update.
+        Only updates GUI every 100ms or when progress changes by 1%.
+        """
+        current_time = time.time() * 1000
+        
+        with self._progress_lock:
+            self._last_progress_values = (processed_count, total_count)
             
-            if processed_count == total_count:
+            # Calculate percentage change
+            if total_count > 0:
+                new_percent = int((processed_count / total_count) * 100)
+                percent_changed = abs(new_percent - self._last_displayed_percent) >= self.PROGRESS_PERCENT_THRESHOLD
+            else:
+                percent_changed = False
+            
+            # Determine if update should happen
+            time_elapsed = current_time - self._last_progress_update
+            is_complete = processed_count == total_count
+            should_update = (
+                time_elapsed >= self.PROGRESS_THROTTLE_MS or 
+                percent_changed or 
+                is_complete or
+                processed_count == 1  # Always update first file
+            )
+            
+            # Skip if already scheduled or not time to update
+            if self._progress_update_scheduled and not is_complete:
+                return
+            
+            if not should_update:
+                return
+            
+            self._progress_update_scheduled = True
+            self._last_progress_update = current_time
+        
+        # Schedule the actual GUI update
+        def update():
+            with self._progress_lock:
+                self._progress_update_scheduled = False
+                proc, total = self._last_progress_values
+            
+            if total > 0:
+                percent = int((proc / total) * 100)
+                self._last_displayed_percent = percent
+                self.progress_bar["value"] = percent
+                self.progress_text.config(text=f"Processing file {proc} of {total}... {percent}%")
+            
+            if proc == total:
                 self.progress_text.config(text="Processing complete!")
                 self.status_label.config(text="Ready")
                 self.toggle_controls(processing=False)
@@ -564,6 +673,12 @@ class LawyerFileOrganizerUI(tk.Tk):
         self.toggle_controls(processing=False)
 
     def batch_import_clients(self):
+        import csv
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            load_workbook = None
+        
         file_path = filedialog.askopenfilename(
             title="Select Client List File",
             filetypes=[("Supported Files", "*.txt *.csv *.xlsx")]
@@ -585,12 +700,129 @@ class LawyerFileOrganizerUI(tk.Tk):
                         if name:
                             new_clients.add(name)
 
-            elif ext in [".csv", ".xlsx"]:
-                df = pd.read_csv(file_path) if ext == ".csv" else pd.read_excel(file_path)
-                if df.empty:
+            elif ext == ".csv":
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    data = [row for row in reader if any(cell.strip() for cell in row)]
+                
+                if not data:
+                    messagebox.showwarning("Empty File", "The CSV contains no data.")
+                    return
+
+                # Ask for orientation
+                orientation_window = Toplevel(self)
+                orientation_window.title("Select Orientation")
+                orientation_window.geometry("300x150")
+                orientation_window.transient(self)
+                orientation_window.grab_set()
+
+                tk.Label(orientation_window, text="How are client names arranged?").pack(pady=10)
+                orientation_choice = tk.StringVar(value="column")
+
+                ttk.Radiobutton(orientation_window, text="Single Column", variable=orientation_choice, value="column").pack(anchor="w", padx=40)
+                ttk.Radiobutton(orientation_window, text="Single Row", variable=orientation_choice, value="row").pack(anchor="w", padx=40)
+
+                confirmed = tk.BooleanVar(value=False)
+
+                def confirm_orientation():
+                    confirmed.set(True)
+                    orientation_window.destroy()
+
+                ttk.Button(orientation_window, text="Next", command=confirm_orientation).pack(pady=10)
+                orientation_window.wait_variable(confirmed)
+                orientation = orientation_choice.get()
+
+                if orientation == "column":
+                    # Get column headers
+                    col_window = Toplevel(self)
+                    col_window.title("Select Column")
+                    col_window.geometry("300x200")
+                    col_window.transient(self)
+                    col_window.grab_set()
+
+                    ttk.Label(col_window, text="Select the column with client names:").pack(pady=10)
+                    
+                    # Get column count from first row
+                    num_cols = len(data[0])
+                    columns = [f"Column {i+1}" for i in range(num_cols)]
+                    col_choice = tk.StringVar(value=columns[0])
+
+                    col_dropdown = ttk.Combobox(col_window, textvariable=col_choice, values=columns, state="readonly")
+                    col_dropdown.pack(pady=5)
+
+                    skip_header_var = tk.BooleanVar(value=False)
+                    ttk.Checkbutton(col_window, text="First row is header (skip)", variable=skip_header_var).pack(pady=5)
+
+                    confirm = tk.BooleanVar(value=False)
+
+                    def confirm_column():
+                        confirm.set(True)
+                        col_window.destroy()
+
+                    ttk.Button(col_window, text="Import", command=confirm_column).pack(pady=10)
+                    col_window.wait_variable(confirm)
+
+                    # Extract column index
+                    col_idx = int(col_choice.get().split()[-1]) - 1
+                    start_row = 1 if skip_header_var.get() else 0
+
+                    for row in data[start_row:]:
+                        if col_idx < len(row):
+                            val = row[col_idx].strip()
+                            if val:
+                                new_clients.add(val)
+
+                else:  # row orientation
+                    row_window = Toplevel(self)
+                    row_window.title("Select Row")
+                    row_window.geometry("300x200")
+                    row_window.transient(self)
+                    row_window.grab_set()
+
+                    ttk.Label(row_window, text="Select the row with client names:").pack(pady=10)
+                    row_indices = [f"Row {i+1}" for i in range(len(data))]
+                    row_choice = tk.StringVar(value=row_indices[0])
+
+                    row_dropdown = ttk.Combobox(row_window, textvariable=row_choice, values=row_indices, state="readonly")
+                    row_dropdown.pack(pady=5)
+
+                    skip_first_var = tk.BooleanVar(value=False)
+                    ttk.Checkbutton(row_window, text="First column is header (skip)", variable=skip_first_var).pack(pady=5)
+
+                    confirm = tk.BooleanVar(value=False)
+
+                    def confirm_row():
+                        confirm.set(True)
+                        row_window.destroy()
+
+                    ttk.Button(row_window, text="Import", command=confirm_row).pack(pady=10)
+                    row_window.wait_variable(confirm)
+
+                    idx = int(row_choice.get().split()[-1]) - 1
+                    start_col = 1 if skip_first_var.get() else 0
+                    
+                    for val in data[idx][start_col:]:
+                        val = val.strip()
+                        if val:
+                            new_clients.add(val)
+
+            elif ext == ".xlsx":
+                if not load_workbook:
+                    messagebox.showerror("Missing Dependency", 
+                        "openpyxl is not installed. Excel import is disabled.\n\n"
+                        "Install with: pip install openpyxl")
+                    return
+                
+                wb = load_workbook(file_path, read_only=True, data_only=True)
+                ws = wb.active
+                data = [[cell if cell is not None else "" for cell in row] for row in ws.iter_rows(values_only=True)]
+                data = [row for row in data if any(str(cell).strip() for cell in row)]
+                
+                if not data:
                     messagebox.showwarning("Empty File", "The spreadsheet contains no data.")
                     return
 
+                # Ask for orientation
                 orientation_window = Toplevel(self)
                 orientation_window.title("Select Orientation")
                 orientation_window.geometry("300x150")
@@ -621,7 +853,9 @@ class LawyerFileOrganizerUI(tk.Tk):
                     col_window.grab_set()
 
                     ttk.Label(col_window, text="Select the column with client names:").pack(pady=10)
-                    columns = list(df.columns)
+                    
+                    num_cols = len(data[0])
+                    columns = [f"Column {i+1}" for i in range(num_cols)]
                     col_choice = tk.StringVar(value=columns[0])
 
                     col_dropdown = ttk.Combobox(col_window, textvariable=col_choice, values=columns, state="readonly")
@@ -639,15 +873,16 @@ class LawyerFileOrganizerUI(tk.Tk):
                     ttk.Button(col_window, text="Import", command=confirm_column).pack(pady=10)
                     col_window.wait_variable(confirm)
 
-                    series = df[col_choice.get()]
-                    if skip_header_var.get():
-                        series = series[1:]
+                    col_idx = int(col_choice.get().split()[-1]) - 1
+                    start_row = 1 if skip_header_var.get() else 0
 
-                    for val in series:
-                        if isinstance(val, str) and val.strip():
-                            new_clients.add(val.strip())
+                    for row in data[start_row:]:
+                        if col_idx < len(row):
+                            val = str(row[col_idx]).strip()
+                            if val:
+                                new_clients.add(val)
 
-                else:
+                else:  # row orientation
                     row_window = Toplevel(self)
                     row_window.title("Select Row")
                     row_window.geometry("300x200")
@@ -655,7 +890,7 @@ class LawyerFileOrganizerUI(tk.Tk):
                     row_window.grab_set()
 
                     ttk.Label(row_window, text="Select the row with client names:").pack(pady=10)
-                    row_indices = [f"Row {i+1}" for i in range(len(df))]
+                    row_indices = [f"Row {i+1}" for i in range(len(data))]
                     row_choice = tk.StringVar(value=row_indices[0])
 
                     row_dropdown = ttk.Combobox(row_window, textvariable=row_choice, values=row_indices, state="readonly")
@@ -674,13 +909,14 @@ class LawyerFileOrganizerUI(tk.Tk):
                     row_window.wait_variable(confirm)
 
                     idx = int(row_choice.get().split()[-1]) - 1
-                    row = df.iloc[idx]
-                    if skip_first_var.get():
-                        row = row[1:]
-                    for val in row:
-                        if isinstance(val, str) and val.strip():
-                            new_clients.add(val.strip())
+                    start_col = 1 if skip_first_var.get() else 0
+                    
+                    for val in data[idx][start_col:]:
+                        val = str(val).strip()
+                        if val:
+                            new_clients.add(val)
 
+            # Process all collected names
             for name in new_clients:
                 parts = name.split()
                 if len(parts) == 2:
@@ -704,7 +940,6 @@ class LawyerFileOrganizerUI(tk.Tk):
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import clients: {e}")
             self.log_activity(f"Batch import failed: {e}", "error")
-
 
 if __name__ == "__main__":
     app = LawyerFileOrganizerUI()

@@ -39,7 +39,7 @@ def get_client_display_name(client: Client) -> str:
         return f"{client.first.capitalize()} {client.last.capitalize()}"
 
 def has_valid_extension(file_path):
-    return file_path.suffix.lower() in [".pdf", ".docx", ".txt"]
+    return file_path.suffix.lower() in [".pdf", ".docx", ".txt",".png",".js",".json"]
 
 def extract_text(file_path):
     ext = file_path.suffix.lower()
